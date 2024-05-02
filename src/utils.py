@@ -12,7 +12,9 @@ import matplotlib.pyplot as plt
 from seaborn import color_palette
 from torch.optim.lr_scheduler import _LRScheduler
 import cv2
-
+from transformers import Mask2FormerForUniversalSegmentation
+import torch.nn.functional as F
+import torchvision.transforms as T
 
 
 class Normalize:
@@ -127,14 +129,18 @@ class SimpleDataset(Dataset):
 
 
 def get_holemask(final_size, prob=.3, base_size=16):
+    resize_mask = lambda x: \
+        T.functional.resize(
+            x, final_size, interpolation=T.InterpolationMode.NEAREST)
+
     hole_mask32 = torch.tensor(prob).repeat((1, 32, 32)).bernoulli()
-    hole_mask32 = T.functional.resize(hole_mask32, final_size, interpolation=T.InterpolationMode.NEAREST)
+    hole_mask32 = resize_mask(hole_mask32)
 
     hole_mask16 = torch.tensor(prob).repeat((1, 16, 16)).bernoulli()
-    hole_mask16 = T.functional.resize(hole_mask16, final_size, interpolation=T.InterpolationMode.NEAREST)
+    hole_mask16 = resize_mask(hole_mask16)
 
     hole_mask8 = torch.tensor(prob).repeat((1, 8, 8)).bernoulli()
-    hole_mask8 = T.functional.resize(hole_mask8, final_size, interpolation=T.InterpolationMode.NEAREST)
+    hole_mask8 = resize_mask(hole_mask8)
 
     hole_mask = hole_mask32 + hole_mask16 + hole_mask8
 
@@ -150,9 +156,7 @@ def get_newshape(oldh, oldw, long_length=1024):
     return (neww, newh)
 
 
-def resize_im(
-    im, long_length=1024, fl_pad=False, inter_nearest=False
-    ):
+def resize_im(im, long_length=1024, fl_pad=False, inter_nearest=False):
 
     target_size = get_newshape(*im.shape[:2], long_length=long_length)
     if im.ndim == 3 and im.shape[2] == 1:
@@ -252,7 +256,7 @@ class TorchColorizer(Colorizer):
 
     def __call__(self, classmap):
         tmp = self.colors[classmap]
-        return tmp.permute(0, 4, 2, 3, 1)[...,0]
+        return tmp.permute(0, 4, 2, 3, 1)[..., 0]
 
 
 def float_to_uint8(x):
@@ -282,7 +286,7 @@ def get_CM(pred, label, n_classes):
 def get_CM_fromloader(dloader, model, n_classes, ix_nolabel=255):
     CM_abs = np.zeros((n_classes, n_classes), dtype=int)
 
-    #for inp_labelholes, inp_label, inp_im in dloader:
+    # for inp_labelholes, inp_label, inp_im in dloader:
     #    test_preds = model(inp_labelholes.cuda(), inp_im.cuda()).cpu()
     #    test_preds = test_preds.argmax(1, keepdim=True)
     for inp_im, inp_label in dloader:
@@ -350,3 +354,58 @@ def create_dirpath_ifneeded(p):
     if not os.path.exists(d):
         os.makedirs(d)
 
+
+class CocoProcessor:
+
+    def __init__(self, coco):
+        self.coco = coco
+        self.cat_ids = coco.getCatIds()
+
+    def ann2mask(self, ann):
+        return ann['category_id'] * self.coco.annToMask(ann)
+
+    def mask_from_anns(self, anns):
+        mask = np.stack(list(map(self.ann2mask, anns)), axis=0)
+        # In case of class overlapping, higher classes are priorotized
+        mask = mask.max(0)
+        return mask
+
+    def mask_from_cocoim(self, cocoim):
+        anns_ids = self.coco.getAnnIds(
+            imgIds=cocoim, catIds=self.cat_ids, iscrowd=None)
+        anns = self.coco.loadAnns(anns_ids)
+        mask = self.mask_from_anns(anns)
+        return mask
+
+
+class MyMask2Former(Mask2FormerForUniversalSegmentation):
+
+    def forward(self, input, label=None):
+
+        if label is not None:
+            mask_labels = F.one_hot(label, num_classes=self.n_classes).float()
+            mask_labels = mask_labels.permute(0, 3, 1, 2)
+            mask_labels = [m for m in mask_labels]
+            class_labels = [torch.arange(self.n_classes).to(input.device)] * len(input)
+        else:
+            mask_labels = None
+            class_labels = None
+
+
+        output = super().forward(
+            pixel_values=input,
+            mask_labels=mask_labels,
+            class_labels=class_labels
+        )
+
+        # Get classes probs and remove the last class (the empty class)
+        masks_classes = output.class_queries_logits.softmax(-1)[..., :-1]
+        masks_probs = output.masks_queries_logits
+        masks_probs = F.interpolate(masks_probs, input.shape[-2:])
+
+        masks_probs = masks_probs.sigmoid()
+        segmentation_map = torch.einsum("bqc, bqhw -> bchw", masks_classes, masks_probs)
+        segmentation_map = F.interpolate(segmentation_map, input.shape[-2:])
+        segmentation_map = segmentation_map.argmax(dim=1, keepdim=True)
+
+        return segmentation_map, output.loss
