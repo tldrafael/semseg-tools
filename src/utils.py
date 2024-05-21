@@ -14,7 +14,6 @@ from torch.optim.lr_scheduler import _LRScheduler
 import cv2
 from transformers import Mask2FormerForUniversalSegmentation
 import torch.nn.functional as F
-import torchvision.transforms as T
 
 
 class Normalize:
@@ -56,7 +55,7 @@ class SimpleDataset(Dataset):
     def __init__(
         self, annotation_file, dirbase=None, has_label=True,
         transform=None, transform_target=None,
-        transform_color=None, ix_nolabel=255, fl_pad=True,
+        transform_color=None, ix_nolabel=255, pad=False,
         long=352, **kwargs
     ):
 
@@ -77,15 +76,19 @@ class SimpleDataset(Dataset):
         self.ix_nolabel = ix_nolabel
         self.has_label = has_label
 
-        self.normalize = T.Normalize(
-            mean=[.485, .456, .406], std=[.229, .224, .225])
+        self.normalize = Normalize.forward
+        self.long = long
+        self.pad = pad
 
-        self.long_length = long
+        rtk2mocamba = torch.Tensor([0, 2, 15+1, 12, 6, 15+2, 3, 15+3, 15+4, 15+5, 15+6, 15+7, 4]).long()
+        self.n_classes = rtk2mocamba.max() + 1
+        self.remap_labels = rtk2mocamba
 
     def __len__(self):
         return len(self.impaths)
 
     def __getitem__(self, idx):
+        self.path = self.impaths[idx]
         image = read_image(self.impaths[idx])
         oldh, oldw = image.shape[1:]
 
@@ -99,24 +102,28 @@ class SimpleDataset(Dataset):
 
         image = self.normalize(image / 255)
 
-        # label
         if self.has_label:
             label = read_image(self.labelpaths[idx])
+
+            # Change RTK integers to mocamba standard.
+            if 'RTK' in self.path and not 'unlabeled' in self.path:
+                label = self.remap_labels[label.long()]
+
             if self.transform:
                 set_randomseed(seed=state)
                 label = self.transform_target(label).to(torch.uint8)
         else:
             label = torch.zeros((1, oldh, oldw))
 
-        if oldw != self.long_length:
-            neww, newh = get_newshape(oldh, oldw, self.long_length)
+        if self.pad and oldw != self.long:
+            neww, newh = get_newshape(oldh, oldw, self.long)
 
             image = T.functional.resize(
                 image, (newh, neww), antialias=True,
                 interpolation=T.InterpolationMode.BICUBIC)
 
-            padh = self.long_length - newh
-            padw = self.long_length - neww
+            padh = self.long - newh
+            padw = self.long - neww
             image = nn.functional.pad(image, (0, padw, 0, padh)).float()
 
             label = T.functional.resize(
@@ -129,9 +136,12 @@ class SimpleDataset(Dataset):
 
 
 def get_holemask(final_size, prob=.3, base_size=16):
+
     resize_mask = lambda x: \
         T.functional.resize(
-            x, final_size, interpolation=T.InterpolationMode.NEAREST)
+            x, final_size,
+            interpolation=T.InterpolationMode.NEAREST
+        )
 
     hole_mask32 = torch.tensor(prob).repeat((1, 32, 32)).bernoulli()
     hole_mask32 = resize_mask(hole_mask32)
@@ -148,17 +158,17 @@ def get_holemask(final_size, prob=.3, base_size=16):
     return hole_mask
 
 
-def get_newshape(oldh, oldw, long_length=1024):
-    scale = long_length * 1.0 / max(oldh, oldw)
+def get_newshape(oldh, oldw, long=1024):
+    scale = long * 1.0 / max(oldh, oldw)
     newh, neww = oldh * scale, oldw * scale
     neww = int(neww + 0.5)
     newh = int(newh + 0.5)
     return (neww, newh)
 
 
-def resize_im(im, long_length=1024, fl_pad=False, inter_nearest=False):
+def resize_im(im, long=1024, fl_pad=False, inter_nearest=False):
 
-    target_size = get_newshape(*im.shape[:2], long_length=long_length)
+    target_size = get_newshape(*im.shape[:2], long=long)
     if im.ndim == 3 and im.shape[2] == 1:
         im = im[:, :, 0]
 
@@ -172,8 +182,8 @@ def resize_im(im, long_length=1024, fl_pad=False, inter_nearest=False):
 
     if fl_pad:
         newh, neww = newim.shape[:2]
-        padh = long_length - newh
-        padw = long_length - neww
+        padh = long - newh
+        padw = long - neww
 
         if newim.ndim == 3 and newim.shape[2] == 3:
             pad_values = (124, 116, 104)
@@ -190,21 +200,15 @@ def resize_im(im, long_length=1024, fl_pad=False, inter_nearest=False):
 
 class SignDataset(SimpleDataset):
 
-    def __init__(self, final_size, hole_prob=0.3, **kwargs):
+    def __init__(self, hole_prob=0.3, **kwargs):
 
         super().__init__(**kwargs)
 
-        n_classes = 16
-        # mocambique
-        # sign_labels = torch.Tensor([3, 6, 10]).long()
-        # rtk
-        sign_labels = torch.Tensor([4, 5, 6]).long()
+        mocamba_signlabels = torch.Tensor([3, 6, 15+2]).long()
+        self.remap_signs = torch.zeros(self.n_classes).long()
+        self.remap_signs[mocamba_signlabels] = torch.arange(len(mocamba_signlabels)) + 1
+        self.mocamba_signlabels = mocamba_signlabels
 
-        remap_labels = torch.zeros(n_classes).long()
-        remap_labels[sign_labels] = torch.arange(len(sign_labels)) + 1
-        self.remap_labels = remap_labels
-
-        self.final_size = final_size
         self.hole_prob = hole_prob
 
     def __len__(self):
@@ -215,8 +219,8 @@ class SignDataset(SimpleDataset):
         h, w = image.shape[1:]
 
         if self.has_label:
-            label = self.remap_labels[label]
-            hole_mask = get_holemask(self.final_size, self.hole_prob)
+            label = self.remap_signs[label]
+            hole_mask = get_holemask(label.shape[-2:], self.hole_prob)
             hole_label = label.clone()
             hole_label[hole_mask] = 0
         else:
@@ -283,17 +287,23 @@ def get_CM(pred, label, n_classes):
         n_classes, n_classes, order='F').astype(int)
 
 
-def get_CM_fromloader(dloader, model, n_classes, ix_nolabel=255):
+def get_CM_fromloader(
+    dloader, model, n_classes, ix_nolabel=255, filling_signs=False
+):
+
     CM_abs = np.zeros((n_classes, n_classes), dtype=int)
 
-    # for inp_labelholes, inp_label, inp_im in dloader:
-    #    test_preds = model(inp_labelholes.cuda(), inp_im.cuda()).cpu()
-    #    test_preds = test_preds.argmax(1, keepdim=True)
-    for inp_im, inp_label in dloader:
-        test_preds = model(inp_im.cuda())[0].cpu()
-
-        for pr_i, y_i in zip(test_preds, inp_label):
-            CM_abs += get_CM(pr_i, y_i, n_classes)
+    if filling_signs:
+        for inp_labelholes, inp_label, inp_im in dloader:
+            test_preds = model(inp_labelholes.cuda(), inp_im.cuda()).cpu()
+            test_preds = test_preds.argmax(1, keepdim=True)
+            for pr_i, y_i in zip(test_preds, inp_label.cpu()):
+                CM_abs += get_CM(pr_i, y_i, n_classes)
+    else:
+        for inp_im, inp_label in dloader:
+            test_preds = model(inp_im.cuda())[0].cpu()
+            for pr_i, y_i in zip(test_preds, inp_label.cpu()):
+                CM_abs += get_CM(pr_i, y_i, n_classes)
 
     pred_P = CM_abs.sum(axis=0)
     gt_P = CM_abs.sum(axis=1)
@@ -365,10 +375,13 @@ class CocoProcessor:
         return ann['category_id'] * self.coco.annToMask(ann)
 
     def mask_from_anns(self, anns):
-        mask = np.stack(list(map(self.ann2mask, anns)), axis=0)
+        gt = np.stack(list(map(self.ann2mask, anns)), axis=0)
         # In case of class overlapping, higher classes are priorotized
-        mask = mask.max(0)
-        return mask
+        newgt = gt[-1]
+        for x in gt[:-1][::-1]:
+            mask = (newgt == 0)
+            newgt[mask] = x[mask]
+        return newgt
 
     def mask_from_cocoim(self, cocoim):
         anns_ids = self.coco.getAnnIds(
@@ -386,11 +399,11 @@ class MyMask2Former(Mask2FormerForUniversalSegmentation):
             mask_labels = F.one_hot(label, num_classes=self.n_classes).float()
             mask_labels = mask_labels.permute(0, 3, 1, 2)
             mask_labels = [m for m in mask_labels]
-            class_labels = [torch.arange(self.n_classes).to(input.device)] * len(input)
+            class_labels = [
+                torch.arange(self.n_classes).to(input.device)] * len(input)
         else:
             mask_labels = None
             class_labels = None
-
 
         output = super().forward(
             pixel_values=input,
@@ -404,8 +417,30 @@ class MyMask2Former(Mask2FormerForUniversalSegmentation):
         masks_probs = F.interpolate(masks_probs, input.shape[-2:])
 
         masks_probs = masks_probs.sigmoid()
-        segmentation_map = torch.einsum("bqc, bqhw -> bchw", masks_classes, masks_probs)
+        segmentation_map = torch.einsum(
+            "bqc, bqhw -> bchw", masks_classes, masks_probs)
         segmentation_map = F.interpolate(segmentation_map, input.shape[-2:])
         segmentation_map = segmentation_map.argmax(dim=1, keepdim=True)
 
         return segmentation_map, output.loss
+
+
+
+class ModelHelper:
+
+    input_from_path = \
+        T.Compose([
+            read_image,
+            T.Lambda(lambda x: x / 255),
+            Normalize.forward,
+            T.Lambda(lambda x: x[None].cuda())
+        ])
+
+
+def read_trainlist(fpath):
+    with open(fpath, 'r') as f:
+        lines = f.read().split('\n')
+    if len(lines[-1]) == 0:
+        lines = lines[:-1]
+    return lines
+
