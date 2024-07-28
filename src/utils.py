@@ -14,6 +14,7 @@ from torch.optim.lr_scheduler import _LRScheduler
 import cv2
 from transformers import Mask2FormerForUniversalSegmentation
 import torch.nn.functional as F
+import dataset as ds
 
 
 class Normalize:
@@ -80,7 +81,8 @@ class SimpleDataset(Dataset):
         self.long = long
         self.pad = pad
 
-        rtk2mocamba = torch.Tensor([0, 2, 15+1, 12, 6, 15+2, 3, 15+3, 15+4, 15+5, 15+6, 15+7, 4]).long()
+        # rtk2mocamba = torch.Tensor([0, 2, 15+1, 12, 6, 15+2, 3, 15+3, 15+4, 15+5, 15+6, 15+7, 4]).long()
+        rtk2mocamba = ds.rtk2mocamba
         self.n_classes = rtk2mocamba.max() + 1
         self.remap_labels = rtk2mocamba
 
@@ -287,10 +289,12 @@ def get_CM(pred, label, n_classes):
         n_classes, n_classes, order='F').astype(int)
 
 
+@torch.no_grad()
 def get_CM_fromloader(
     dloader, model, n_classes, ix_nolabel=255, filling_signs=False
 ):
 
+    model.eval()
     CM_abs = np.zeros((n_classes, n_classes), dtype=int)
 
     if filling_signs:
@@ -444,3 +448,22 @@ def read_trainlist(fpath):
         lines = lines[:-1]
     return lines
 
+
+def cv2_imread(p):
+    im = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+
+    if im.ndim == 3:
+        chs = im.shape[2]
+        assert chs in [3, 4]
+
+        if chs == 3:
+            im = im[..., ::-1]
+        else:
+            im = cv2.cvtColor(im, cv2.COLOR_BGRA2RGBA)
+
+    return im
+
+
+def mask_to_3d(x):
+    assert x.ndim == 2
+    return np.repeat(x[..., None], 3, axis=2)
